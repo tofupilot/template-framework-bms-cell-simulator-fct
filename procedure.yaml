@@ -1,0 +1,167 @@
+name: BMS Cell Simulator Functional Test
+version: 0.1.0
+description: Functional test of a 16S BMS PCBA on a battery cell simulator. Identity and config readback, per-channel voltage accuracy on a staircase, gain and offset from a three-point sweep, open-wire detection, sense tap resistance, ship-mode current.
+
+unit:
+  auto_identify: true
+  serial_number:
+    description: "Scan the board data-matrix before it goes into the fixture"
+    placeholder: "BMS16-00000"
+    pattern: "^BMS16-\\d{5}$"
+    default_value: "BMS16-01742"
+  part_number:
+    default_value: "PCB-BMS-16S-R3"
+  batch_number:
+    default_value: "LOT-2026-37"
+
+plugs:
+  - name: BMS Bench
+    description: "16-channel cell simulator and DUT UART link (mock Chroma 87001-class, one plug per bench)"
+    python: plugs.bms_bench:BmsBench
+    key: bench
+    config:
+      cell_count: 16
+      bleed_ma: 80
+
+setup:
+  - name: Identify DUT
+    key: identify_dut
+    python: phases.identify_dut
+    measurements:
+      - name: Firmware Version
+        key: firmware_version
+        description: Production firmware line is 2.x; a 1.x board was flashed from the wrong release.
+        validators:
+          - {operator: matches, expected_value: "^2\\.\\d+\\.\\d+$"}
+      - name: AFE Identity
+        key: afe_identity
+        description: AFE part and cell count as one object; a 3S variant of the same PCB must fail here.
+        validators:
+          - operator: "=="
+            expected_value:
+              afe: BQ76952
+              cell_count: 16
+      - name: Config CRC
+        key: config_crc
+        description: CRC of the protection configuration block, must match the released config.
+        validators:
+          - {operator: "==", expected_value: "0x3A7F"}
+
+main:
+  - name: Cell Voltage Accuracy
+    key: cell_voltage_accuracy
+    python: phases.cell_voltage_accuracy
+    measurements:
+      - name: Staircase
+        key: staircase
+        title: Reported vs simulator readback per channel
+        x_axis:
+          legend: Channel
+        y_axis:
+          - legend: Forced
+            key: forced
+            unit: mV
+          - legend: Reported
+            key: reported
+            unit: mV
+          - legend: Error
+            key: error
+            unit: mV
+            aggregations:
+              - type: max_mv
+                unit: mV
+                validators:
+                  - {operator: "<=", expected_value: 3.5}
+              - type: min_mv
+                unit: mV
+                validators:
+                  - {operator: ">=", expected_value: -4.0}
+      - name: Channel Order
+        key: order_ok
+        description: Readback rises with channel index; a crossed pair in the sense harness breaks it.
+        validators:
+          - {operator: "==", expected_value: true}
+
+  - name: Gain Offset Sweep
+    key: gain_offset_sweep
+    python: phases.gain_offset_sweep
+    depends_on: [cell_voltage_accuracy]
+    measurements:
+      - name: Linearity
+        key: linearity
+        title: Gain error and offset per channel from a 3-point sweep
+        x_axis:
+          legend: Channel
+        y_axis:
+          - legend: Gain error
+            key: gain_err
+            unit: "%"
+            aggregations:
+              - type: max_abs_pct
+                unit: "%"
+                validators:
+                  - {operator: "<=", expected_value: 0.10}
+          - legend: Offset
+            key: offset
+            unit: mV
+            aggregations:
+              - type: max_abs_mv
+                unit: mV
+                validators:
+                  - {operator: "<=", expected_value: 3.0}
+
+  - name: Open Wire Check
+    key: open_wire_check
+    python: phases.open_wire_check
+    depends_on: [gain_offset_sweep]
+    measurements:
+      - name: Open Wire Flagged
+        key: open_wire_flagged
+        description: The DUT must raise the open-wire fault for the opened channel, not report a plausible voltage.
+        validators:
+          - {operator: "==", expected_value: true}
+      - name: Open Wire Reading
+        key: open_wire_reading_mv
+        unit: mV
+        description: What the AFE reads on the floating input, recorded for trending, no limit.
+      - name: Faults After Reconnect
+        key: faults_after_reconnect
+        validators:
+          - operator: "=="
+            expected_value:
+              open_wire: []
+              ov: []
+              uv: []
+
+  - name: Tap Resistance
+    key: tap_resistance
+    python: phases.tap_resistance
+    depends_on: [open_wire_check]
+    timeout: 60s
+    measurements:
+      - name: Tap Path
+        key: tap_path
+        title: Sense tap series resistance per channel
+        x_axis:
+          legend: Channel
+        y_axis:
+          - legend: Resistance
+            key: resistance
+            unit: mΩ
+            aggregations:
+              - type: max_mohm
+                unit: mΩ
+                validators:
+                  - {operator: "<=", expected_value: 150.0}
+
+teardown:
+  - name: Shutdown
+    key: shutdown
+    python: phases.shutdown
+    measurements:
+      - name: Ship Current
+        key: ship_current_ua
+        unit: µA
+        description: Stack draw in ship mode on the simulator's 250 uA range; a stuck balancing FET or a wrong pull-up shows here.
+        validators:
+          - {operator: "<=", expected_value: 250.0}
